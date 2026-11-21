@@ -1,0 +1,110 @@
+{
+  "mode": "adaptive",
+  "process_cap_bytes": 134217728,
+  "logical_budget_bytes": 16777216,
+  "rows_A": 1000000,
+  "rows_B": 25000,
+  "generate_seconds": 2.815,
+  "elapsed_seconds": 45.437,
+  "peak_rss_bytes": 88420352,
+  "peak_rss_mib": 84.32,
+  "logical_peak_bytes": 1626408,
+  "spill": {
+    "temp_dir": "/tmp/bench1m-gf31q2r_/joinexec-semy4ssh",
+    "files": 10,
+    "bytes_written": 55332201,
+    "bytes_read": 110664402,
+    "records_written": 1025000
+  },
+  "joins": [
+    {
+      "join_id": "j1",
+      "join_type": "inner",
+      "mode_final": "disk",
+      "build_rows": 25000,
+      "probe_rows": 1000000,
+      "outputs": 3949850,
+      "left_padded": 0,
+      "build_rid_range": [
+        0,
+        24999
+      ],
+      "probe_rid_range": [
+        0,
+        999999
+      ],
+      "hot_keys": [
+        [
+          "[100]",
+          13
+        ],
+        [
+          "[101]",
+          13
+        ],
+        [
+          "[102]",
+          13
+        ],
+        [
+          "[103]",
+          13
+        ],
+        [
+          "[104]",
+          13
+        ],
+        [
+          "[105]",
+          13
+        ],
+        [
+          "[106]",
+          13
+        ],
+        [
+          "[107]",
+          13
+        ],
+        [
+          "[108]",
+          13
+        ],
+        [
+          "[109]",
+          13
+        ]
+      ],
+      "partitions": 4,
+      "merge_partitions": [],
+      "residual_count": 0,
+      "reserved_peak_bytes": 1508464,
+      "switch_events": [
+        {
+          "join_id": "j1",
+          "reason": "skew_or_control",
+          "phase_at_switch": "build",
+          "outputs_before_switch": 0,
+          "build_rows_seen": 25000,
+          "probe_rows_seen": 1000000,
+          "build_rid_range": [
+            0,
+            24999
+          ],
+          "probe_rid_range": [
+            0,
+            999999
+          ],
+          "partitions": 4,
+          "residual": null,
+          "spill_bytes_written_so_far": 55332201
+        }
+      ]
+    }
+  ],
+  "output_groups": 2001,
+  "expected_groups": 2001,
+  "expected_total_join_rows": 3949850,
+  "verified_bag_aggregate": true,
+  "error": null
+}

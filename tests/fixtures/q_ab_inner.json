@@ -1,0 +1,6 @@
+{
+  "node": "join", "id": "j1", "type": "inner",
+  "left":  {"node": "scan", "relation": "A", "alias": "a", "file": "tests/fixtures/A.jsonl"},
+  "right": {"node": "scan", "relation": "B", "alias": "b", "file": "tests/fixtures/B.jsonl"},
+  "on": [["a.k", "b.k"]]
+}

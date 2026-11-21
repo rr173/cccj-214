@@ -1,0 +1,17 @@
+{
+  "relations": {
+    "A": [
+      {"name": "k", "type": "int64"},
+      {"name": "v", "type": "int64"},
+      {"name": "tag", "type": "text"}
+    ],
+    "B": [
+      {"name": "k", "type": "int64"},
+      {"name": "w", "type": "int64"}
+    ],
+    "C": [
+      {"name": "k", "type": "int64"},
+      {"name": "c", "type": "text"}
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+{"row_id": 1, "k": 10, "v": 100, "tag": "a1"}
+{"row_id": 2, "k": 10, "v": 200, "tag": "a2"}
+{"row_id": 3, "k": 99, "v": 7, "tag": "unmatched"}
+{"row_id": 4, "k": null, "v": 9, "tag": "nullkey"}

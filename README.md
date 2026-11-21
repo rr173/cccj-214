@@ -20,6 +20,8 @@ optimizer and not a wrapper around an external database.
 | real runtime memory→disk switch (build pressure, probe hot group, two control points) | `join_exec/join.py` |
 | already-emitted results not replayed; remainder not lost | residual suppression records |
 | independent nested-loop oracle sharing no product machinery | `join_exec/reference.py` |
+| durable, content-addressed result provenance (row + count/sum proofs) | `join_exec/provenance.py`, `join_exec/proof_store.py` |
+| independent proof oracle enumerating witnesses from raw inputs only | `tests/proof_oracle.py` |
 | million-row skew run under a hard 128 MiB process cap | `bench/bench_1m.py` |
 
 ## The memory→disk transition
@@ -93,6 +95,118 @@ left row at most once.  No business-value deduplication and no
   enforces the 128 MiB cap with `RLIMIT_AS`, so logical accounting is
   cross-checked against the OS.
 
+## Result provenance (auditable source proofs)
+
+A query can optionally deliver, **separately from its business results**, a
+durable proof for every output row and every terminal count/sum value.
+Proofs never change row values, filter predicates, join matching or
+aggregate results: they are produced by an observer side channel
+(`Row.proof_ref`, `HybridJoin.proof_sink`) attached only for the run.
+
+### What a proof says
+
+* **scan / filter / project** — one proof per passing tuple naming every
+  contributing base `(alias, row_id)`.  Filter rows that evaluate to FALSE
+  or UNKNOWN have no proof above the filter (their scan record exists as an
+  input only).  Projection collisions — different input combinations
+  producing identical business values — keep distinct proofs.
+* **inner / left join match** — a proof naming the full contributing input
+  combination.  **LEFT pads** carry only the left sources plus
+  `"no_right_match": true`; a right `row_id` is never fabricated.
+* **semi join** — one output per left row, but its proof contains the left
+  witness plus **every real matching right row**; suppressed/duplicate
+  matches are not counted.
+* **count** — one contribution per input row actually counted.
+* **sum** — contributions only from non-NULL inputs, with
+  `excluded_null_contributors` recording how many NULL inputs were skipped;
+  all-NULL input yields `sum = NULL` with zero contributions, and empty
+  input yields `count = 0` / `sum = NULL` proofs with no sources.
+
+### Stable references and durable layout
+
+Proof references are SHA-256 content ids over the node id, proof kind and
+contributing sources (`rp_…` for rows, `ap_…` for aggregates).  They do not
+depend on temp directory names, iteration order or process addresses, so the
+same logical source yields the same reference in memory and disk
+executions and across re-runs.  Re-running against identical inputs recreates
+the same `run_id` (a digest of the canonical query tree).
+
+```
+<proof-dir>/<run-id>/
+  manifest.json            # present ONLY after a successful commit
+  data/shard-XX.jsonl      # framed proof documents (h/w/c/t JSONL frames)
+  index/shard-XX.jsonl     # proof_ref -> offset/length/witness/distinct counts
+  index/shard-XX.dir.jsonl # sparse pid/offset directory for paged lookup
+  mapping/shard-XX.jsonl   # output row seq -> proof_ref + value hash
+```
+
+`ProofReader` opens a committed run after the executor and its spill
+directory are gone: `get_proof(ref)` assembles one document,
+`iter_proof_frames(ref)` streams a high-fanout proof with constant reader
+memory, and `iter_index`/`iter_output_mappings` page via opaque tokens.
+Join output order is not promised; output mapping rows carry `seq`.
+
+### Memory, fan-out and the mid-switch merge
+
+Proof events stream into fixed JSONL staging shards — nothing is
+accumulated per proof in Python, so a single count/sum proof can hold more
+combinations than the whole budget (a 20 000-combination proof runs under a
+12 KiB budget).  Commit uses a bounded external sort (chunk floor plus
+round-wise merges of at most 8 runs) and streams each proof document while
+tracking exact per-proof and global distinct source counts through a
+budget-bounded set that spills to an external-sort file on overflow.  The
+store reports actual bytes written/read, file count, proof/witness counts,
+distinct-source counts and the output-row ↔ proof mapping.
+
+When a join switches from memory to disk after emitting partial matches,
+the residual-suppression machinery guarantees the proof stream sees each
+real combination exactly once: already delivered pairs are not replayed and
+suppressed duplicates never become sources.  Memory, forced-disk and
+adaptive (switched) executions produce identical proof reference and content
+sets — asserted by the randomized property tests.
+
+### Failure semantics
+
+A proof write failure, disk exhaustion, corrupt input, consumer early close
+or cancellation raises (`ProofError`, `BadRowError`, `RunCancelled`) and the
+run directory is removed entirely.  The manifest is published last via
+atomic rename, so no partial proof index can ever look complete, and neither
+business rows nor proofs are reported as successfully delivered.
+
+### API and CLI
+
+```python
+from join_exec import ProofStore, ProvenanceSession, ProofReader
+from join_exec.engine import _assign_node_ids
+
+store = ProofStore(proof_dir, budget, shards=8)
+session = ProvenanceSession(store, tree, _assign_node_ids(tree))
+engine.provenance = session
+for row in engine.run(engine.build(tree)):
+    print(row.proof_ref)          # stable reference on every output row
+reader = ProofReader.open(proof_dir, session.run_id)
+reader.get_proof(row.proof_ref)   # assembled proof document
+```
+
+```bash
+python3 -m join_exec.cli run --schema s.json --query q.json \
+    --memory-bytes 1048576 --proof-dir ./proofs --stats stats.json
+python3 -m join_exec.cli proof stats    --proof-dir ./proofs --run-id run-xxxx
+python3 -m join_exec.cli proof get      --proof-dir ./proofs --run-id run-xxxx --proof-ref rp_...
+python3 -m join_exec.cli proof stream   --proof-dir ./proofs --run-id run-xxxx --proof-ref ap_...
+python3 -m join_exec.cli proof index    --proof-dir ./proofs --run-id run-xxxx --page-size 128
+python3 -m join_exec.cli proof mappings --proof-dir ./proofs --run-id run-xxxx
+```
+
+The end-to-end scenario catalogue (three-way collision query, LEFT pad,
+SEMI multi-match, partial-NULL composite key, all-NULL/empty aggregates,
+mid-switch merge, over-budget single high-fanout proof, write failure and
+cancellation — each verified against the independent oracle) is:
+
+```bash
+python3 -I demo/provenance_demo.py --workdir /tmp/proof-demo
+```
+
 ## Query tree
 
 ```json
@@ -112,8 +226,9 @@ Nodes: `scan`, `filter` (3VL), `project`, `join` (`inner|left|semi`),
 ## Run it
 
 ```bash
-# full test suite (41 tests, including the independent oracle and
-# 300-trial randomized property checks)
+# full test suite (61 tests, including the independent business oracle,
+# the independent proof oracle, randomized property checks and all
+# provenance failure/lifecycle scenarios)
 python3 -m unittest discover -s tests -v
 
 # headline scenario: switch after the 2nd of 6 pairs, total stays 6
@@ -156,14 +271,21 @@ runs and against the independent oracle, asserting full bag equality
 ## Failure semantics
 
 Bad JSONL / out-of-range ints → `BadRowError`; spill IO failure → `SpillError`;
-consumer close / `ControlPoint.cancel()` → deterministic termination with
-files and sub-iterators closed (`RunCancelled`).  No cross-process recovery is
-attempted in this version, per the stated scope.
+proof-file IO failure / disk exhaustion → `ProofError` (the partial proof
+directory is removed and no manifest is published); consumer close /
+`ControlPoint.cancel()` → deterministic termination with files and
+sub-iterators closed (`RunCancelled`).  No cross-process recovery is
+attempted in this version, per the stated scope; committed proof
+directories are independent of spill temp directories and remain readable
+after the executor exits and all temp resources are cleaned.
 
 ## Layout
 
 ```
-join_exec/   product executor (engine, join operator, spill, budget, ops, oracle)
-tests/       unittest suite + small JSONL/JSON fixtures (no large data)
+join_exec/   product executor (engine, join operator, spill, budget, ops,
+             oracle, durable provenance session + proof store)
+tests/       unittest suite + small JSONL/JSON fixtures (no large data);
+             proof_oracle.py is an independent witness enumerator
+demo/        reproducible end-to-end provenance scenario catalogue
 bench/       runtime million-row generator, 128 MiB-capped runner, results JSON
 ```

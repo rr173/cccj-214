@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from join_exec import (
     Budget,
     ControlPoint,
+    ProofStore,
+    ProvenanceSession,
     QueryEngine,
     ReferenceInterpreter,
     SchemaCatalog,
@@ -95,3 +97,43 @@ def assert_bag_equals_reference(testcase, tree: dict, rows: List[Row]) -> None:
 
 def _slots_of(tree: dict, row: Optional[Row]) -> List[str]:
     return []
+
+
+def run_with_proof(tree: dict, proof_dir: str, temp_dir: str,
+                   memory_bytes: int = 4 * 1024 * 1024,
+                   mode: str = "adaptive",
+                   skew_threshold: Optional[int] = None,
+                   control: Optional[ControlPoint] = None,
+                   join_overrides: Optional[dict] = None,
+                   shards: int = 8,
+                   write_fault: Optional[Any] = None
+                   ) -> Tuple[List[Row], dict, SpillManager,
+                              ProofStore, ProvenanceSession]:
+    """Build and drain a provenance-enabled run; returns committed artifacts."""
+    budget = Budget(memory_bytes)
+    control = control or ControlPoint()
+    spill = SpillManager(budget, base_dir=temp_dir)
+    engine = QueryEngine(catalog(), budget, spill, control, mode=mode,
+                         skew_threshold=skew_threshold,
+                         join_overrides=join_overrides)
+    store = ProofStore(proof_dir, budget, shards=shards)
+    if write_fault is not None:
+        store.write_fault = write_fault
+    from join_exec.engine import _assign_node_ids
+    session = ProvenanceSession(
+        store, tree, _assign_node_ids(tree))
+    engine.provenance = session
+    plan = engine.build(tree)
+    try:
+        rows = list(engine.run(plan))
+        stats = engine.stats()
+        return rows, stats, spill, store, session
+    finally:
+        spill.cleanup()
+
+
+def write_jsonl(path: str, rows: List[dict]) -> str:
+    with open(path, "w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    return path

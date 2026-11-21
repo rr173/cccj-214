@@ -158,16 +158,30 @@ class Aggregate:
     Output schema slots are named ``key_<n>`` plus ``count`` and ``sum_<field>``.
     ``sum`` over a group with no non-NULL input yields NULL.  Both count and
     sum are checked int64.
+
+    Optional hooks (used by the provenance layer only; default behaviour is
+    unchanged):
+
+    * ``emit_empty_group`` — when there are no group keys and the input is
+      empty, emit one ``(count=0, sum=NULL)`` group instead of no rows,
+      matching SQL scalar aggregation and giving empty-count proofs a home.
+    * ``observer`` — called as ``observer(row, group_key)`` for every input
+      row actually counted, so count/sum proofs can be streamed to disk
+      without the aggregate materialising any extra state.
     """
 
     def __init__(self, header: Header, key_refs: Sequence[str],
                  sum_ref: Optional[str], budget: Budget,
-                 group_alias: str = "agg") -> None:
+                 group_alias: str = "agg",
+                 emit_empty_group: bool = False,
+                 observer: Optional[Any] = None) -> None:
         self.header_in = header
         self.key_refs = list(key_refs)
         self.sum_ref = sum_ref
         self.budget = budget
         self.group_alias = group_alias
+        self.emit_empty_group = emit_empty_group
+        self.observer = observer
         self._key_idx = [header.find_ref(r) for r in key_refs]
         self._sum_idx = header.find_ref(sum_ref) if sum_ref else None
         slots = tuple((group_alias, f"key_{i}") for i in range(len(self._key_idx)))
@@ -193,11 +207,18 @@ class Aggregate:
                     self._groups[key] = [0, 0, False, est]
                 g = self._groups[key]
                 g[0] = checked_add_int64(g[0], 1)
+                if self.observer is not None:
+                    self.observer(row, key)
                 if self._sum_idx is not None:
                     v = row.values[self._sum_idx]
                     if v is not None:
                         g[1] = checked_add_int64(g[1], v)
                         g[2] = True
+            if not self._groups and self.emit_empty_group and not self._key_idx:
+                values = [0]
+                if self.sum_ref:
+                    values.append(None)
+                out.append(Row(values, []))
             for key, (cnt, total, has_non_null, _est) in self._groups.items():
                 values = list(key) + [cnt]
                 if self.sum_ref:

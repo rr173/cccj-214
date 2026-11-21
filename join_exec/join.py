@@ -128,6 +128,10 @@ class HybridJoin:
         self.stats = JoinStats(join_id, join_type,
                                left_refs[0][0], right_refs[0][0])
         self._owner = f"join:{join_id}"
+        # Optional provenance sink.  When set, every emitted match/pad is
+        # reported here *in addition* to yielding the business row; the sink
+        # never alters values, predicates or the number of outputs.
+        self.proof_sink: Optional["object"] = None
         self._reserved = 0
         # memory-phase state
         self._ht: Dict[Any, List[Row]] = {}
@@ -159,12 +163,26 @@ class HybridJoin:
         return make_join_key(row, self.right.header, self.right_refs)
 
     def _combine(self, lrow: Row, rrow: Row) -> Row:
-        return Row(tuple(lrow.values) + tuple(rrow.values),
-                   tuple(lrow.rids) + tuple(rrow.rids))
+        out = Row(tuple(lrow.values) + tuple(rrow.values),
+                  tuple(lrow.rids) + tuple(rrow.rids))
+        if self.proof_sink is not None:
+            self.proof_sink.note_match(self.join_id, out)
+        return out
+
+    def _note_semi(self, lrow: Row, rrow: Row) -> None:
+        if self.proof_sink is not None:
+            # A SEMI output still carries one proof covering the left row
+            # plus *every* real matching right row, so all matches are
+            # reported even though the join yields the left row only once.
+            self.proof_sink.note_semi_match(self.join_id, lrow, rrow)
 
     def _pad(self, lrow: Row) -> Row:
         width = len(self.right.header.slots)
-        return Row(tuple(lrow.values) + (None,) * width, lrow.rids)
+        out = Row(tuple(lrow.values) + (None,) * width, lrow.rids,
+                  is_pad=True)
+        if self.proof_sink is not None:
+            self.proof_sink.note_pad(self.join_id, out)
+        return out
 
     def _rid(self, row: Row, alias: str) -> int:
         return row.rid_of(alias)
@@ -262,12 +280,16 @@ class HybridJoin:
     def _probe_match(self, lrow: Row, matches: List[Row],
                      left_iter: Iterator[Row], key: Any) -> Iterator[Row]:
         emitted_right_rids: set = set()
+        if self.join_type == "semi":
+            # One output for this left row, but every real right match is
+            # reported to the proof sink so its proof lists all witnesses.
+            self.stats.outputs += 1
+            for rrow in matches:
+                self._note_semi(lrow, rrow)
+            yield lrow
+            return
         for rrow in matches:
             emitted_right_rids.add(self._rid(rrow, self.right_refs[0][0]))
-            if self.join_type == "semi":
-                self.stats.outputs += 1
-                yield lrow
-                break
             self.stats.outputs += 1
             yield self._combine(lrow, rrow)
             if self.control is not None and self.control.note_output(self.join_id):
@@ -540,18 +562,24 @@ class HybridJoin:
                 suppress_rids = self._suppress_set(suppress)
                 matched_here = bool(suppress_rids)
                 if key in ht:
-                    for rrow in ht[key]:
-                        rrid = self._rid(rrow, self.right_refs[0][0])
-                        if rrid in suppress_rids:
-                            continue
-                        if self.join_type == "semi":
+                    if self.join_type == "semi":
+                        for rrow in ht[key]:
+                            rrid = self._rid(rrow, self.right_refs[0][0])
+                            if rrid in suppress_rids:
+                                continue
+                            self._note_semi(lrow, rrow)
+                            matched_here = True
+                        if matched_here:
                             self.stats.outputs += 1
                             yield lrow
+                    else:
+                        for rrow in ht[key]:
+                            rrid = self._rid(rrow, self.right_refs[0][0])
+                            if rrid in suppress_rids:
+                                continue
+                            self.stats.outputs += 1
+                            yield self._combine(lrow, rrow)
                             matched_here = True
-                            break
-                        self.stats.outputs += 1
-                        yield self._combine(lrow, rrow)
-                        matched_here = True
                 if not matched_here and self.join_type == "left":
                     self.stats.left_padded += 1
                     yield self._pad(lrow)
@@ -703,6 +731,9 @@ class HybridJoin:
                         matched_rids.add(identity)
                         self.stats.outputs += 1
                         yield lrow
+                    # Every real (unsuppressed) match is a proof witness,
+                    # even though only one left row is emitted.
+                    self._note_semi(lrow, rrow)
                     continue
                 matched = True
                 matched_rids.add(identity)

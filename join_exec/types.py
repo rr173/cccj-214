@@ -115,15 +115,29 @@ class Row:
 
     Values are kept in a tuple: rows are only ever rebuilt (never mutated),
     and tuples avoid the per-row list overhead, which matters at 1M rows.
+
+    Side-channel metadata (never part of business values, filters, keys or
+    aggregates):
+
+    * ``is_pad`` marks a LEFT-join padding row (the right-side slots are
+      fabricated NULLs).  It lets the provenance layer distinguish a pad
+      from a real match whose right values happen to all be NULL.
+    * ``proof_ref`` carries the stable, content-addressed provenance
+      reference for this output row.  It is attached by the provenance
+      session only; plain runs leave it ``None``.
     """
 
-    __slots__ = ("values", "rids", "size")
+    __slots__ = ("values", "rids", "size", "is_pad", "proof_ref")
 
     def __init__(self, values: Sequence[Any], rids: Sequence[Any],
-                 size: Optional[int] = None) -> None:
+                 size: Optional[int] = None,
+                 is_pad: bool = False,
+                 proof_ref: Optional[str] = None) -> None:
         self.values: Tuple[Any, ...] = tuple(values)
         self.rids: Tuple[Any, ...] = tuple(rids)
         self.size: int = size if size is not None else estimate_row_size(self.values)
+        self.is_pad: bool = is_pad
+        self.proof_ref: Optional[str] = proof_ref
 
     def rid_of(self, alias: str) -> int:
         rids = self.rids
@@ -132,8 +146,15 @@ class Row:
                 return rids[i + 1]
         raise SchemaError(f"row has no rid for alias {alias!r}")
 
+    def sources(self) -> Tuple[Tuple[str, int], ...]:
+        """The contributing base rows as a canonical, sorted tuple."""
+        return tuple(sorted(
+            (self.rids[i], self.rids[i + 1])
+            for i in range(0, len(self.rids), 2)))
+
     def copy(self) -> "Row":
-        return Row(self.values, self.rids, self.size)
+        return Row(self.values, self.rids, self.size,
+                   is_pad=self.is_pad, proof_ref=self.proof_ref)
 
     def to_jsonable(self) -> dict:
         paired = [list(self.rids[i:i + 2])

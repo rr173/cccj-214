@@ -31,3 +31,12 @@ class SpillError(JoinExecError):
 
 class RunCancelled(JoinExecError):
     """The run was cancelled via a control point or consumer close."""
+
+
+class ProofError(JoinExecError):
+    """Writing, committing or reading a durable proof store failed.
+
+    Raised on proof-file IO failure or disk exhaustion.  A run that raises
+    this never publishes a proof manifest: partial proof artifacts are
+    removed, so no index can be mistaken for a complete proof set.
+    """

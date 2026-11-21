@@ -18,11 +18,14 @@ from .errors import (
     BadRowError,
     JoinExecError,
     MemoryLimitExceeded,
+    ProofError,
     RunCancelled,
     SchemaError,
     SpillError,
 )
 from .join import HybridJoin
+from .proof_store import ProofReader, ProofStore
+from .provenance import ProvenanceSession
 from .reference import ReferenceInterpreter
 from .schema_catalog import SchemaCatalog
 from .spill import SpillManager
@@ -37,10 +40,14 @@ __all__ = [
     "BadRowError",
     "JoinExecError",
     "MemoryLimitExceeded",
+    "ProofError",
     "RunCancelled",
     "SchemaError",
     "SpillError",
     "HybridJoin",
+    "ProofReader",
+    "ProofStore",
+    "ProvenanceSession",
     "ReferenceInterpreter",
     "SchemaCatalog",
     "SpillManager",

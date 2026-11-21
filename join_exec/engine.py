@@ -33,7 +33,6 @@ from .schema_catalog import SchemaCatalog
 from .spill import SpillManager
 from .types import Header, Row
 
-
 @dataclass
 class PlanJoin:
     join_id: str
@@ -50,6 +49,8 @@ class PlanJoin:
 class PlanNode:
     kind: str
     header: Header
+    node_id: str = ""
+    tree_node: Optional[dict] = None
     scan: Optional[Scan] = None
     filter: Optional[Filter] = None
     project: Optional[Project] = None
@@ -78,6 +79,10 @@ class QueryEngine:
         self._join_seq = 0
         self.joins: List[HybridJoin] = []
         self.scan_operators: List[Scan] = []
+        # Active provenance session (None for plain runs).
+        self.provenance = None
+        # Pre-order node ids keyed by tree-node object identity.
+        self._node_id_map: Dict[int, str] = {}
 
     # ------------------------------------------------------------ planning
     def build(self, tree: dict) -> PlanNode:
@@ -86,38 +91,45 @@ class QueryEngine:
             raise SchemaError(
                 f"join tree must have 2-6 leaf inputs (3-6 required by spec), "
                 f"got {leaves}")
-        return self._build_node(normalize_inner_tree(tree))
+        normalized = normalize_inner_tree(tree)
+        self._node_id_map = _assign_node_ids(normalized)
+        return self._build_node(normalized)
 
     def _build_node(self, node: dict) -> PlanNode:
         kind = node["node"]
+        node_id = self._node_id_map[id(node)]
         if kind == "scan":
-            return self._build_scan(node)
+            return self._build_scan(node, node_id)
         if kind == "filter":
             child = self._build_node(node["input"])
             flt = Filter(node["expr"], child.header)
-            return PlanNode("filter", child.header, filter=flt, child=child)
+            return PlanNode("filter", child.header, node_id=node_id,
+                            tree_node=node, filter=flt, child=child)
         if kind == "project":
             child = self._build_node(node["input"])
             proj = Project(child.header, [tuple(x) for x in node["outputs"]])
-            return PlanNode("project", proj.header, project=proj, child=child)
+            return PlanNode("project", proj.header, node_id=node_id,
+                            tree_node=node, project=proj, child=child)
         if kind == "join":
-            return self._build_join(node)
+            return self._build_join(node, node_id)
         if kind == "aggregate":
             child = self._build_node(node["input"])
             agg = Aggregate(child.header, node.get("keys", []),
                             node.get("sum"), self.budget)
-            return PlanNode("aggregate", agg.header, aggregate=agg, child=child)
+            return PlanNode("aggregate", agg.header, node_id=node_id,
+                            tree_node=node, aggregate=agg, child=child)
         raise SchemaError(f"unknown node kind {kind!r}")
 
-    def _build_scan(self, node: dict) -> PlanNode:
+    def _build_scan(self, node: dict, node_id: str) -> PlanNode:
         rel = node["relation"]
         alias = node.get("alias", rel)
         schema = self.catalog.get(rel)
         scan = Scan(schema, node["file"], alias, control=self.control)
         self.scan_operators.append(scan)
-        return PlanNode("scan", scan.header, scan=scan)
+        return PlanNode("scan", scan.header, node_id=node_id,
+                        tree_node=node, scan=scan)
 
-    def _build_join(self, node: dict) -> PlanNode:
+    def _build_join(self, node: dict, node_id: str) -> PlanNode:
         jtype = node["type"]
         left = self._build_node(node["left"])
         right = self._build_node(node["right"])
@@ -148,12 +160,18 @@ class QueryEngine:
             expected_build_rows=override.get("expected_build_rows"),
             batch_size=override.get("batch_size", self.batch_size),
         )
+        if self.provenance is not None:
+            hj.proof_sink = self.provenance.join_sink(node_id)
         self.joins.append(hj)
-        return PlanNode("join", hj.header, join=hj,
+        return PlanNode("join", hj.header, node_id=node_id,
+                        tree_node=node, join=hj,
                         children=[left, right])
 
     # ------------------------------------------------------------ runtime
     def _open(self, plan: PlanNode) -> Iterator[Row]:
+        if self.provenance is not None:
+            yield from self._open_pv(plan)
+            return
         if plan.kind == "scan":
             yield from plan.scan
         elif plan.kind == "filter":
@@ -167,8 +185,75 @@ class QueryEngine:
         else:  # pragma: no cover
             raise SchemaError(f"cannot open node {plan.kind}")
 
+    def _open_pv(self, plan: PlanNode) -> Iterator[Row]:
+        """Same physical operators, wrapped so every emitted row gets a
+        proof.  Business values and row counts are untouched."""
+        pv = self.provenance
+        if plan.kind == "scan":
+            for row in plan.scan:
+                pv.record_scan(plan.node_id, row)
+                yield row
+        elif plan.kind == "filter":
+            role = "filter_pass"
+            for row in plan.filter.apply(
+                    self._open_pv(plan.child), self.control):
+                pv.record_passthrough(plan.node_id, "filter", row, role)
+                yield row
+        elif plan.kind == "project":
+            for row in plan.project.apply(
+                    self._open_pv(plan.child), self.control):
+                pv.record_passthrough(plan.node_id, "project", row, "project")
+                yield row
+        elif plan.kind == "join":
+            # The join reports matches/pads/semi events itself via its sink;
+            # its children's proofs are produced when their streams open.
+            yield from plan.join
+        elif plan.kind == "aggregate":
+            yield from self._open_pv_aggregate(plan)
+        else:  # pragma: no cover
+            raise SchemaError(f"cannot open node {plan.kind}")
+
+    def _open_pv_aggregate(self, plan: PlanNode) -> Iterator[Row]:
+        pv = self.provenance
+        agg = plan.aggregate
+        node = plan.tree_node
+        sum_ref = node.get("sum")
+        key_refs = list(node.get("keys", []))
+        pv.prepare_aggregate(plan.node_id, sum_ref, key_refs)
+        sum_idx = agg._sum_idx  # noqa: SLF001 - same-package instrumentation
+        agg.emit_empty_group = True
+        agg.observer = pv.make_agg_observer(plan.node_id, sum_idx)
+        rows = agg.run(self._open_pv(plan.child), self.control)
+        rows = pv.annotate_aggregate_rows(
+            plan.node_id, rows, len(key_refs), sum_ref is not None)
+        for row in rows:
+            yield row
+
     def run(self, plan: PlanNode) -> Iterator[Row]:
-        return self._open(plan)
+        if self.provenance is None:
+            return self._open(plan)
+        return self._run_provenance(plan)
+
+    def _run_provenance(self, plan: PlanNode) -> Iterator[Row]:
+        """Streaming provenance run.
+
+        Rows are yielded as produced.  The proof commit happens only when
+        the consumer drains the whole stream; closing/cancelling the
+        generator aborts the run and removes all proof artifacts.
+        """
+        pv = self.provenance
+        try:
+            for row in self._open_pv(plan):
+                pv.record_output(row, plan.node_id)
+                yield row
+        except GeneratorExit:
+            pv.abort()
+            raise
+        except BaseException:
+            pv.abort()
+            raise
+        else:
+            pv.commit()
 
     # ------------------------------------------------------------ explain
     def explain(self, tree: dict) -> dict:
@@ -194,7 +279,7 @@ class QueryEngine:
         }
 
     def stats(self) -> dict:
-        return {
+        stats = {
             "budget": self.budget.snapshot(),
             "spill": {
                 "temp_dir": self.spill.temp_dir,
@@ -207,6 +292,9 @@ class QueryEngine:
             "scans": [{"alias": s.alias, "rows": s.rows_scanned}
                       for s in self.scan_operators],
         }
+        if self.provenance is not None:
+            stats["provenance_run_id"] = self.provenance.run_id
+        return stats
 
 
 def _join_stats(j: HybridJoin) -> dict:
@@ -261,6 +349,27 @@ def count_leaves(node: dict) -> int:
     if node["node"] == "join":
         return count_leaves(node["left"]) + count_leaves(node["right"])
     return count_leaves(node["input"])
+
+
+def _assign_node_ids(tree: dict) -> Dict[int, str]:
+    """Pre-order stable node ids; explicit join ids are preserved."""
+    out: Dict[int, str] = {}
+    counter = {"n": 0}
+
+    def walk(node: dict) -> None:
+        if node["node"] == "join":
+            out[id(node)] = node.get("id") or f"n{counter['n']}"
+        else:
+            out[id(node)] = f"n{counter['n']}"
+        counter["n"] += 1
+        if node["node"] == "join":
+            walk(node["left"])
+            walk(node["right"])
+        elif node["node"] != "scan":
+            walk(node["input"])
+
+    walk(tree)
+    return out
 
 
 def normalize_inner_tree(node: dict) -> dict:

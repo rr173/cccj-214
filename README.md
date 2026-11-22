@@ -21,6 +21,7 @@ optimizer and not a wrapper around an external database.
 | already-emitted results not replayed; remainder not lost | residual suppression records |
 | independent nested-loop oracle sharing no product machinery | `join_exec/reference.py` |
 | durable, content-addressed result provenance (row + count/sum proofs) | `join_exec/provenance.py`, `join_exec/proof_store.py` |
+| durable, incrementally refreshed SQLite summary view with local-access evidence | `join_exec/materialized.py`, `join_exec/incremental_oracle.py` |
 | independent proof oracle enumerating witnesses from raw inputs only | `tests/proof_oracle.py` |
 | million-row skew run under a hard 128 MiB process cap | `bench/bench_1m.py` |
 
@@ -207,6 +208,91 @@ cancellation — each verified against the independent oracle) is:
 python3 -I demo/provenance_demo.py --workdir /tmp/proof-demo
 ```
 
+## Durable, incrementally refreshed summary view
+
+Offline fact tables change a few rows at a time, but the maintained aggregate
+used to require re-running the whole query. `join_exec.materialized` adds a
+**continuously refreshed summary view** persisted in a local SQLite state
+database. It is initialized once from the full JSONL inputs; afterwards
+callers submit only the row corrections of the batch and readers get the
+refreshed full summary from the state database — no original files, no
+full-query re-execution. The one-shot query and provenance features above
+are untouched.
+
+### Maintained query shape (the only shape accepted)
+
+```
+AGGREGATE keys=[<cat-alias>.<group-column>]  sum=<fact-alias>.<int64-column>
+  SEMI JOIN  on  fact.<elig-key> = elig.<key>
+    LEFT JOIN  on  fact.<cat-key> = cat.<key>
+      scan fact        scan category
+    scan eligibility
+```
+
+All semantics match the one-shot engine: duplicate category rows each
+contribute (including equal group values), an unmatched/NULL-key LEFT fact
+contributes exactly one NULL-padded row, SEMI only keeps/drops the fact
+without multiplying, NULL join keys never match, NULL category values are a
+legal group, all-NULL-amount groups publish `sum = NULL`, empty groups
+disappear, and sums are exact int64-checked so an out-of-range published
+value rejects the batch regardless of correction ordering.
+
+### API
+
+```python
+from join_exec import MaterializedSummary
+
+view = MaterializedSummary.initialize("state.db", tree, catalog)
+# later, possibly in another process:
+view = MaterializedSummary.open("state.db")
+evidence = view.apply_corrections([
+    {"relation": "F", "row_id": 7, "op": "upsert",
+     "row": {"row_id": 7, "fk": 10, "ek": 100, "amt": 5}},
+    {"relation": "C", "row_id": 9, "op": "delete"},
+])
+view.version()        # one entry point for the current version
+view.read_summary()   # one entry point for the whole committed summary
+view.close()
+```
+
+Every valid non-empty batch publishes the next version even when the visible
+summary is identical. A batch runs in one SQLite transaction: bad rows,
+deleting a missing `row_id`, int64 overflow or an injected write/publish
+fault all roll back, so source rows, maintenance state, summary and version
+advance together or not at all; reopening resumes from the last committed
+version.
+
+### Refresh locality and its testable evidence
+
+A refresh reads only the directly corrected rows, the facts associated with
+the changed category/eligibility keys, and the category/eligibility match
+state of those facts — via indexed point lookups; unrelated facts are never
+scanned and only affected groups are updated. The evidence is inspectable,
+not just a row count:
+
+* the durable `access_trace` table (surfaced through `access_trace()`,
+  `last_access_trace()`, `trace_summary()` and the `apply_corrections`
+  return value) records every localized access with the table, `row_id` or
+  join key and the publishing version; failed batches roll their traces back;
+* `explain_local_access()` returns `EXPLAIN QUERY PLAN` output for each
+  lookup statement, asserting index `SEARCH` plans rather than table scans;
+* `apply_corrections` returns the exact set of affected fact `row_id`s and
+  the groups that changed.
+
+The independent ground truth is `join_exec.incremental_oracle`, a row-by-row
+enumerator over plain row maps that shares no incremental machinery; the
+tests also cross-check against the original `ReferenceInterpreter` running
+the full query.
+
+```bash
+# 25 materialized-view tests (oracle + original-engine cross-checks,
+# locality evidence, order independence, overflow, fault/reopen recovery)
+python3 -m unittest tests.test_materialized_summary -v
+
+# end-to-end reproducible scenario catalogue (small generated fixtures only)
+python3 -I demo/materialized_summary_demo.py --workdir /tmp/ms-demo
+```
+
 ## Query tree
 
 ```json
@@ -283,9 +369,11 @@ after the executor exits and all temp resources are cleaned.
 
 ```
 join_exec/   product executor (engine, join operator, spill, budget, ops,
-             oracle, durable provenance session + proof store)
+             oracle, durable provenance session + proof store, durable
+             incremental materialized summary view)
 tests/       unittest suite + small JSONL/JSON fixtures (no large data);
-             proof_oracle.py is an independent witness enumerator
-demo/        reproducible end-to-end provenance scenario catalogue
+             proof_oracle.py is an independent witness enumerator;
+             incremental_oracle.py independently enumerates maintained rows
+demo/        reproducible end-to-end provenance and materialized-view demos
 bench/       runtime million-row generator, 128 MiB-capped runner, results JSON
 ```

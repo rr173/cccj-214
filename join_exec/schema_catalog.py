@@ -21,6 +21,10 @@ class SchemaCatalog:
             raise SchemaError(f"unknown relation {relation!r}")
         return self._schemas[relation]
 
+    def all(self):
+        """All declared schemas (stable declaration order)."""
+        return tuple(self._schemas.values())
+
     @classmethod
     def from_json(cls, spec: dict) -> "SchemaCatalog":
         return cls(

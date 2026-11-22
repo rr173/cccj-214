@@ -24,6 +24,13 @@ from .errors import (
     SpillError,
 )
 from .join import HybridJoin
+from .materialized import (
+    CorrectionError,
+    MaterializedError,
+    MaterializedSummary,
+    OverflowRejected,
+    SummarySpec,
+)
 from .proof_store import ProofReader, ProofStore
 from .provenance import ProvenanceSession
 from .reference import ReferenceInterpreter
@@ -45,6 +52,11 @@ __all__ = [
     "SchemaError",
     "SpillError",
     "HybridJoin",
+    "MaterializedSummary",
+    "MaterializedError",
+    "CorrectionError",
+    "OverflowRejected",
+    "SummarySpec",
     "ProofReader",
     "ProofStore",
     "ProvenanceSession",

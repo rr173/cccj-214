@@ -22,6 +22,7 @@ optimizer and not a wrapper around an external database.
 | independent nested-loop oracle sharing no product machinery | `join_exec/reference.py` |
 | durable, content-addressed result provenance (row + count/sum proofs) | `join_exec/provenance.py`, `join_exec/proof_store.py` |
 | durable, incrementally refreshed SQLite summary view with local-access evidence | `join_exec/materialized.py`, `join_exec/incremental_oracle.py` |
+| maximal pre-delivery quarantine snapshot cleanup, key-local SQLite propagation with locality evidence | `join_exec/snapshot_cleanup.py`, `tests/snapshot_oracle.py` |
 | independent proof oracle enumerating witnesses from raw inputs only | `tests/proof_oracle.py` |
 | million-row skew run under a hard 128 MiB process cap | `bench/bench_1m.py` |
 
@@ -312,10 +313,14 @@ Nodes: `scan`, `filter` (3VL), `project`, `join` (`inner|left|semi`),
 ## Run it
 
 ```bash
-# full test suite (61 tests, including the independent business oracle,
-# the independent proof oracle, randomized property checks and all
-# provenance failure/lifecycle scenarios)
+# full test suite (the independent business oracle, the independent proof
+# oracle, randomized property checks, all provenance failure/lifecycle
+# scenarios and the snapshot-cleanup oracle cross-checks)
 python3 -m unittest discover -s tests -v
+
+# snapshot cleanup only (27 tests incl. naive-fixpoint oracle cross-checks,
+# hot-key fan-out, long elimination chain and failure-atomicity evidence)
+python3 -m unittest discover -s tests -p test_snapshot_cleanup.py -v
 
 # headline scenario: switch after the 2nd of 6 pairs, total stays 6
 python3 -m join_exec.cli run \
@@ -365,15 +370,110 @@ attempted in this version, per the stated scope; committed proof
 directories are independent of spill temp directories and remain readable
 after the executor exits and all temp resources are cleaned.
 
+## Pre-delivery quarantine snapshot cleanup
+
+An upstream relation snapshot may name a few confirmed-untrusted rows that
+must be isolated before delivery.  Simply deleting those rows is not enough:
+other rows can lose the target they required, and their removal can ripple
+through further tables.  `join_exec.snapshot_cleanup` adds one pre-delivery
+entry point that produces, in a fresh directory, the **maximal** row subset
+in which no retained row has a dangling required reference.
+
+### Contract
+
+A *required reference* rule names a source and a target relation and pairs
+their columns by position (single-column or composite keys; paired columns
+must share a type).  A retained source row must find, for every rule that
+applies to it, at least one retained target row with an equal key.  Equality
+follows the engine's join semantics — any NULL key component can never match
+(NULL ≠ NULL).  Target keys are not unique: removing one target only
+invalidates referrers when no other retained target carries the same key, and
+equal rows are never merged.  Rules may be self-referential or form cycles.
+
+The result is the greatest fixpoint of that contract, not just any
+orphan-free set:
+
+* two accounts that require each other, with no other missing support, are
+  both retained;
+* if one additionally requires a quarantined subject with no substitute, both
+  are removed;
+* a row with no outgoing required reference is never removed just because
+  other rows point at it.
+
+The answer does not depend on input row order, file load order or rule
+order.  Each relation still ships one JSONL file on its original schema
+(empty tables ship a file too); retained `row_id`s and field values are
+unchanged.
+
+### SQLite staging, locality and failure semantics
+
+Nothing is materialised whole in Python: per relation, one row table (the
+original columns plus a status) carries one partial index per outgoing rule;
+per rule, one compact **support table** holds `(distinct target key,
+alive_count)` — one row per distinct key, never a referrer×candidate pair, so
+a many-to-many fan-out of M referrers and N same-key candidates costs O(M+N)
+staging rows rather than O(M·N).  A durable work queue drives key-local
+propagation: a dead row decrements exactly the support counts of the keys it
+carried, and only when a count reaches zero are the referrers on that key
+removed through index point searches.  Unrelated keys and rows are never
+rescanned — there is no per-round full-relation sweep.  A durable,
+count-aggregated `access_trace` plus `explain_local_lookups()` make the
+locality inspectable (index `SEARCH` on row tables; only the compact support
+tables may be scanned).
+
+All staging lives in a temporary directory next to the (not-yet-existing)
+delivery directory; the delivery directory itself is created last by a single
+atomic rename, so any failure removes the working directory and leaves no
+observable partial delivery, and the read-only input files are never touched.
+
+### API and CLI
+
+```python
+from join_exec import SchemaCatalog, clean_snapshot, rules_from_json
+
+catalog = SchemaCatalog.from_json(schema_spec)
+rules = rules_from_json(rule_specs, catalog)
+summary = clean_snapshot(
+    catalog,
+    input_paths={"S": "src/S.jsonl", "F": "src/F.jsonl", "L": "src/L.jsonl"},
+    rules=rules,
+    quarantine=[("S", 1), ("S", 2)],   # may be empty
+    delivery_dir="delivery/")
+summary["output_paths"]   # one JSONL path per relation, handed to executors
+```
+
+```bash
+python3 -m join_exec.cli clean-snapshot \
+  --schema schema.json --inputs inputs.json --rules rules.json \
+  --quarantine quarantine.json --delivery-dir ./delivery --stats stats.json
+```
+
+Bad rows, duplicate `row_id`s, unknown quarantine ids and invalid rules raise
+distinct errors (`BadRowError`, `QuarantineError`, `RuleError`,
+`DeliveryError`).  The independent ground truth is
+`tests/snapshot_oracle.py`, a deliberately naive row-by-row fixpoint that
+shares no cleanup machinery; tests compare exact per-relation retained
+`row_id` sets, not just counts.  The reproducible scenario catalogue (two
+same-key deliveries, complete vs broken cycles, composite NULL keys, multiple
+rules per row, hot-key fan-out, a long elimination chain and injected write
+faults) is:
+
+```bash
+python3 -I demo/snapshot_cleanup_demo.py --workdir /tmp/snap-demo
+```
+
 ## Layout
 
 ```
 join_exec/   product executor (engine, join operator, spill, budget, ops,
              oracle, durable provenance session + proof store, durable
-             incremental materialized summary view)
+             incremental materialized summary view, pre-delivery quarantine
+             snapshot cleanup)
 tests/       unittest suite + small JSONL/JSON fixtures (no large data);
              proof_oracle.py is an independent witness enumerator;
-             incremental_oracle.py independently enumerates maintained rows
-demo/        reproducible end-to-end provenance and materialized-view demos
+             incremental_oracle.py independently enumerates maintained rows;
+             snapshot_oracle.py independently enumerates the retained set
+demo/        reproducible end-to-end provenance, materialized-view and
+             snapshot-cleanup demos
 bench/       runtime million-row generator, 128 MiB-capped runner, results JSON
 ```

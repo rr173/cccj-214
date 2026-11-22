@@ -26,6 +26,7 @@ from .proof_store import ProofReader, ProofStore
 from .provenance import ProvenanceSession
 from .reference import ReferenceInterpreter
 from .schema_catalog import SchemaCatalog
+from .snapshot_cleanup import clean_snapshot, rules_from_json
 from .spill import SpillManager
 
 
@@ -87,10 +88,29 @@ def main(argv=None) -> int:
     pr.add_argument("--token", default=None)
     pr.add_argument("--page-size", type=int, default=128)
 
+    cl = sub.add_parser(
+        "clean-snapshot",
+        help="build a maximal reference-closed snapshot delivery")
+    cl.add_argument("--schema", required=True,
+                    help="schema catalog JSON (same format as run)")
+    cl.add_argument("--inputs", required=True,
+                    help="JSON object mapping relation name to JSONL path")
+    cl.add_argument("--rules", required=True,
+                    help="JSON list of required-reference rule objects")
+    cl.add_argument("--quarantine", default=None,
+                    help="optional JSON list of [relation, row_id] pairs")
+    cl.add_argument("--delivery-dir", required=True,
+                    help="a directory that must not exist yet")
+    cl.add_argument("--stats", default=None,
+                    help="write the result summary JSON here instead of stderr")
+
     args = p.parse_args(argv)
 
     if args.cmd == "proof":
         return _proof_cmd(args)
+
+    if args.cmd == "clean-snapshot":
+        return _clean_snapshot_cmd(args)
 
     catalog, tree = _load(args)
     budget = Budget(args.memory_bytes)
@@ -159,6 +179,42 @@ def main(argv=None) -> int:
         return 2
     finally:
         spill.cleanup()
+
+
+def _clean_snapshot_cmd(args) -> int:
+    try:
+        with open(args.schema, "r", encoding="utf-8") as fh:
+            catalog = SchemaCatalog.from_json(json.load(fh))
+        with open(args.inputs, "r", encoding="utf-8") as fh:
+            input_paths = json.load(fh)
+        if not isinstance(input_paths, dict):
+            raise JoinExecError("--inputs must be a JSON object")
+        with open(args.rules, "r", encoding="utf-8") as fh:
+            rules = rules_from_json(json.load(fh), catalog)
+        quarantine = []
+        if args.quarantine:
+            with open(args.quarantine, "r", encoding="utf-8") as fh:
+                raw_q = json.load(fh)
+            if not isinstance(raw_q, list):
+                raise JoinExecError("--quarantine must be a JSON list")
+            for entry in raw_q:
+                if not isinstance(entry, list) or len(entry) != 2:
+                    raise JoinExecError(
+                        "quarantine entries must be [relation, row_id] pairs")
+                quarantine.append((entry[0], entry[1]))
+        summary = clean_snapshot(catalog, input_paths, rules, quarantine,
+                                 args.delivery_dir)
+    except JoinExecError as exc:
+        sys.stderr.write(
+            f"snapshot cleanup ended: {type(exc).__name__}: {exc}\n")
+        return 2
+    if args.stats:
+        with open(args.stats, "w", encoding="utf-8") as fh:
+            json.dump(summary, fh, indent=2, ensure_ascii=False)
+    else:
+        json.dump(summary, sys.stderr, indent=2, ensure_ascii=False)
+        sys.stderr.write("\n")
+    return 0
 
 
 def _proof_cmd(args) -> int:

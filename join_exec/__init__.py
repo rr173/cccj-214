@@ -35,6 +35,15 @@ from .proof_store import ProofReader, ProofStore
 from .provenance import ProvenanceSession
 from .reference import ReferenceInterpreter
 from .schema_catalog import SchemaCatalog
+from .snapshot_cleanup import (
+    CleanupError,
+    DeliveryError,
+    QuarantineError,
+    ReferenceRule,
+    RuleError,
+    SnapshotCleanup,
+    clean_snapshot,
+)
 from .spill import SpillManager
 from .types import Header, Row, Schema, schema_from_json
 
@@ -67,4 +76,11 @@ __all__ = [
     "Row",
     "Schema",
     "schema_from_json",
+    "SnapshotCleanup",
+    "clean_snapshot",
+    "ReferenceRule",
+    "CleanupError",
+    "QuarantineError",
+    "RuleError",
+    "DeliveryError",
 ]
